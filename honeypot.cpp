@@ -6,8 +6,12 @@
 #include <ctime>
 #include <vector>
 #include <map>
-#include <utility> // For std::pair
-#include <algorithm> // For std::transform
+#include <utility>
+#include <algorithm>
+#include <functional>
+#include <cctype>
+#include <random>
+#include <chrono>
 
 // Windows-specific headers for Winsock
 #include <winsock2.h>
@@ -68,64 +72,90 @@ void printWinsockError(const char* funcName) {
     std::cerr << funcName << " failed with error: " << wsError << std::endl;
 }
 
-// Reads characters until a newline character ('\n') is encountered or buffer is full/error.
-// Handles both LF and CRLF line endings.
 std::string readLine(SOCKET sock) {
     std::string line = "";
     char buffer;
     int bytesReceived;
 
-    // Use a small timeout for recv to prevent blocking indefinitely if
-    // a connection is idle or partially sent data.
-    // This is optional but can improve responsiveness in interactive shells.
-    // struct timeval timeout;
-    // timeout.tv_sec = 10; // 10 second timeout for readLine
-    // timeout.tv_usec = 0;
-    // setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout, sizeof(timeout));
-
     while (true) {
-        bytesReceived = recv(sock, &buffer, 1, 0); // Read one byte at a time
+        bytesReceived = recv(sock, &buffer, 1, 0);
         if (bytesReceived == SOCKET_ERROR) {
-            // WSAGetLastError() can be WSAETIMEDOUT if timeout is set.
-            // If it's a real error (connection reset, etc.), return empty.
             if (WSAGetLastError() != WSAETIMEDOUT) {
-                 // printWinsockError("readLine recv"); // Uncomment for debugging
+                // printWinsockError("readLine recv");
             }
-            return ""; 
+            return "";
         }
-        if (bytesReceived == 0) { // Connection closed by peer
+        if (bytesReceived == 0) {
             return line;
         }
 
-        if (buffer == '\n') { // Found newline, we're done with the line
+        if (buffer == '\n') {
             break;
         }
-        if (buffer != '\r') { // Ignore carriage returns if present
+        if (buffer != '\r') {
             line += buffer;
         }
     }
     return line;
 }
 
-// --- NEW HELPER FUNCTION: Handle Shell-like Interaction ---
-// This function will encapsulate the interactive command logic for Telnet/SSH.
-void handleShellInteraction(SOCKET clientSocket, const std::string& clientIP, int clientPort, const std::string& protocolName) {
-    std::string prompt = "user@honeypot:~# "; // A common shell prompt
 
-    // Send initial prompt
-    std::string initialPrompt = prompt + "\n"; // Add newline for clean display on client
+// --- New FTP Data Connection Handler ---
+void handleFtpDataConnection(SOCKET clientSocket, const std::string& clientIP, const std::string& fileName) {
+    struct _stat info;
+    if (_stat("logs/uploads", &info) != 0) {
+        if (_mkdir("logs/uploads") != 0) {
+            log("FTP Upload Trap: Failed to create logs/uploads directory: " + std::string(strerror(errno)));
+            closesocket(clientSocket);
+            return;
+        }
+    }
+
+    std::string logFilePath = "logs/uploads/" + fileName;
+    std::ofstream uploadedFile(logFilePath, std::ios::binary);
+    if (!uploadedFile) {
+        log("FTP Upload Trap: Failed to create file " + logFilePath + " from " + clientIP);
+        closesocket(clientSocket);
+        return;
+    }
+
+    char buffer[1024];
+    int bytesReceived;
+    size_t totalBytesReceived = 0;
+
+    log("FTP Upload Trap: Receiving file '" + fileName + "' from " + clientIP);
+
+    while ((bytesReceived = recv(clientSocket, buffer, sizeof(buffer), 0)) > 0) {
+        uploadedFile.write(buffer, bytesReceived);
+        totalBytesReceived += bytesReceived;
+    }
+    
+    if (bytesReceived == SOCKET_ERROR) {
+        log("FTP Upload Trap: Error during file transfer from " + clientIP);
+    }
+
+    uploadedFile.close();
+    closesocket(clientSocket);
+
+    log("FTP Upload Trap: Finished receiving file '" + fileName + "'. Total bytes: " + std::to_string(totalBytesReceived));
+}
+
+
+// --- Shell Interaction ---
+void handleShellInteraction(SOCKET clientSocket, const std::string& clientIP, int clientPort, const std::string& protocolName) {
+    std::string prompt = "user@honeypot:~# ";
+    std::string initialPrompt = prompt + "\n";
     send(clientSocket, initialPrompt.c_str(), initialPrompt.length(), 0);
 
     while (true) {
         std::string command = readLine(clientSocket);
-        if (command.empty()) { // Connection closed or error
+        if (command.empty()) {
             log(protocolName + " connection closed or error during command from " + clientIP);
             break;
         }
 
         log(protocolName + " Command from " + clientIP + ": " + command);
 
-        // Basic command parsing (case-insensitive for commands)
         std::string lower_command = command;
         std::transform(lower_command.begin(), lower_command.end(), lower_command.begin(), ::tolower);
 
@@ -135,70 +165,65 @@ void handleShellInteraction(SOCKET clientSocket, const std::string& clientIP, in
             response = "Goodbye!\n";
             send(clientSocket, response.c_str(), response.length(), 0);
             log(protocolName + " Session ended by " + clientIP);
-            break; // Exit loop, close socket
+            break;
         } else if (lower_command == "help") {
-            response = "Available commands: help, ls, pwd, whoami, exit, logout\n";
+            response = "Available commands: help, ls, pwd, whoami, exit, logout, cd, cat, wget, curl\n";
         } else if (lower_command == "ls") {
             response = "bin   dev  etc   home  lib   media  mnt  opt   proc  root  run   sbin  srv   sys  tmp   usr  var\n";
         } else if (lower_command == "pwd") {
             response = "/home/user\n";
         } else if (lower_command == "whoami") {
             response = "user\n";
-        } else if (lower_command.rfind("cd ", 0) == 0) { // Handle 'cd' command
-             response = "bash: cd: No such file or directory\n"; // Fake response
+        } else if (lower_command.rfind("cd ", 0) == 0) {
+             response = "bash: cd: No such file or directory\n";
         } else if (lower_command.rfind("cat ", 0) == 0 || lower_command.rfind("more ", 0) == 0 || lower_command.rfind("less ", 0) == 0) {
-            response = "cat: " + command.substr(command.find(" ") + 1) + ": No such file or directory\n";
+            size_t first_space = command.find(" ");
+            std::string filename_part = (first_space != std::string::npos) ? command.substr(first_space + 1) : "";
+            if (!filename_part.empty()) {
+                 response = command.substr(0, first_space) + ": " + filename_part + ": No such file or directory\n";
+            } else {
+                 response = "cat: Missing operand\n";
+            }
         } else if (lower_command.find("wget ") != std::string::npos || lower_command.find("curl ") != std::string::npos) {
             log(protocolName + " Possible malware download attempt from " + clientIP + ": " + command);
-            response = "wget: command not found\n"; // Or simulate success with a delay
+            response = "wget: command not found\n";
         }
         else {
             response = "bash: " + command + ": command not found\n";
         }
 
         send(clientSocket, response.c_str(), response.length(), 0);
-        send(clientSocket, prompt.c_str(), prompt.length(), 0); // Send prompt again
+        send(clientSocket, prompt.c_str(), prompt.length(), 0);
     }
 }
 
 
-// --- Protocol Handlers (modified) ---
+// --- Protocol Handlers ---
 void handleSshLikeConnection(SOCKET clientSocket, sockaddr_in clientAddr) {
     std::string clientIP = inet_ntoa(clientAddr.sin_addr);
     int clientPort = ntohs(clientAddr.sin_port);
-
     log("SSH-like connection from " + clientIP + ":" + std::to_string(clientPort) + " on port " + std::to_string(SSH_PORT));
-
-    std::string banner = "SSH-2.0-OpenSSH_7.6p1 Ubuntu-4ubuntu0.3\nUsername: "; // More realistic SSH banner
+    std::string banner = "SSH-2.0-OpenSSH_7.6p1 Ubuntu-4ubuntu0.3\nUsername: ";
     send(clientSocket, banner.c_str(), banner.length(), 0);
-    
     std::string username = readLine(clientSocket);
     if (username.empty()) {
         log("Connection closed or error during username receive from " + clientIP);
         closesocket(clientSocket);
         return;
     }
-
     std::string passPrompt = "Password: ";
     send(clientSocket, passPrompt.c_str(), passPrompt.length(), 0);
-    
     std::string password = readLine(clientSocket);
     if (password.empty()) {
         log("Connection closed or error during password receive from " + clientIP);
         closesocket(clientSocket);
         return;
     }
-
     log("Credentials from " + clientIP + ": " + username + "/" + password);
-
-    // Instead of immediate "Access Denied", give them a fake shell
     std::string loginSuccessMsg = "Welcome to Ubuntu 18.04 LTS (GNU/Linux 4.15.0-66-generic x86_64)\n";
     send(clientSocket, loginSuccessMsg.c_str(), loginSuccessMsg.length(), 0);
     log("SSH-like: Presented fake shell to " + clientIP);
-    
-    // Now pass control to the interactive shell handler
     handleShellInteraction(clientSocket, clientIP, clientPort, "SSH-like");
-
     closesocket(clientSocket);
 }
 
@@ -206,9 +231,8 @@ void handleTelnetConnection(SOCKET clientSocket, sockaddr_in clientAddr) {
     std::string clientIP = inet_ntoa(clientAddr.sin_addr);
     int clientPort = ntohs(clientAddr.sin_port);
     log("Telnet connection from " + clientIP + ":" + std::to_string(clientPort) + " on port " + std::to_string(TELNET_PORT));
-    std::string banner = "Welcome to the fake Telnet server.\r\nlogin: "; // Typical telnet login prompt
+    std::string banner = "Welcome to the fake Telnet server.\r\nlogin: ";
     send(clientSocket, banner.c_str(), banner.length(), 0);
-
     std::string username = readLine(clientSocket);
     if (username.empty()) {
         log("Telnet connection closed or error during username receive from " + clientIP);
@@ -216,7 +240,6 @@ void handleTelnetConnection(SOCKET clientSocket, sockaddr_in clientAddr) {
         return;
     }
     log("Telnet login attempt from " + clientIP + ": " + username);
-
     std::string passPrompt = "Password: ";
     send(clientSocket, passPrompt.c_str(), passPrompt.length(), 0);
     std::string password = readLine(clientSocket);
@@ -226,70 +249,10 @@ void handleTelnetConnection(SOCKET clientSocket, sockaddr_in clientAddr) {
         return;
     }
     log("Telnet password attempt from " + clientIP + ": " + password);
-
-    std::string loginMsg = "\r\nLogin Successful. Welcome to honeypot shell.\r\n"; // Fake success
+    std::string loginMsg = "\r\nLogin Successful. Welcome to honeypot shell.\r\n";
     send(clientSocket, loginMsg.c_str(), loginMsg.length(), 0);
     log("Telnet: Presented fake shell to " + clientIP);
-
-    // Now pass control to the interactive shell handler
     handleShellInteraction(clientSocket, clientIP, clientPort, "Telnet");
-
-    closesocket(clientSocket);
-}
-
-void handleFtpConnection(SOCKET clientSocket, sockaddr_in clientAddr) {
-    std::string clientIP = inet_ntoa(clientAddr.sin_addr);
-    int clientPort = ntohs(clientAddr.sin_port);
-    log("FTP connection from " + clientIP + ":" + std::to_string(clientPort) + " on port " + std::to_string(FTP_PORT));
-    std::string banner = "220 Fake FTP Server ready.\r\n";
-    send(clientSocket, banner.c_str(), banner.length(), 0);
-
-    std::string command_line;
-    std::string last_user = ""; 
-
-    while (true) {
-        command_line = readLine(clientSocket);
-        if (command_line.empty()) {
-            log("FTP connection closed by " + clientIP);
-            break;
-        }
-
-        log("FTP command from " + clientIP + ": " + command_line);
-
-        std::string cmd_upper = command_line;
-        std::transform(cmd_upper.begin(), cmd_upper.end(), cmd_upper.begin(), ::toupper);
-
-        if (cmd_upper.rfind("USER ", 0) == 0) {
-            last_user = command_line.substr(5);
-            log("FTP Username captured: " + last_user + " from " + clientIP);
-            std::string response = "331 Password required for " + last_user + ".\r\n";
-            send(clientSocket, response.c_str(), response.length(), 0);
-        } else if (cmd_upper.rfind("PASS ", 0) == 0) {
-            std::string password = command_line.substr(5);
-            log("FTP Password captured: " + password + " for user " + last_user + " from " + clientIP);
-            std::string response = "530 Login incorrect.\r\n"; // Still deny access
-            send(clientSocket, response.c_str(), response.length(), 0);
-            // Even after denial, attackers might send more commands, so don't break yet, just deny.
-            // For a more advanced FTP honeypot, you might allow "login" and then trap commands.
-            // For now, we deny and let them send more commands until QUIT/BYE.
-        } else if (cmd_upper == "QUIT" || cmd_upper == "BYE") {
-            std::string response = "221 Goodbye.\r\n";
-            send(clientSocket, response.c_str(), response.length(), 0);
-            break;
-        } else if (cmd_upper == "SYST") {
-            std::string response = "215 UNIX Type: L8\r\n";
-            send(clientSocket, response.c_str(), response.length(), 0);
-        } else if (cmd_upper == "FEAT") {
-            std::string response = "211-Features:\r\n EPRT\r\n EPSV\r\n MDTM\r\n MFMT\r\n REST STREAM\r\n SIZE\r\n MLST type*;size*;sizd*;modify*;perm*;\r\n MLSD\r\n UTF8\r\n CLNT\r\n TVFS\r\n\r\n";
-            send(clientSocket, response.c_str(), response.length(), 0);
-        } else if (cmd_upper.rfind("HELP", 0) == 0) {
-            std::string response = "214 The following commands are recognized.\r\n CWD   CDUP   QUIT   PORT   PASV   TYPE   STRU   MODE   RETR   STOR   APPE   ALLOC   RNFR   RNTO   DELE   RMD   MKD   PWD   LIST   NLST   SITE   SYST   STAT   HELP   NOOP   FEAT\r\n214 Help OK.\r\n";
-            send(clientSocket, response.c_str(), response.length(), 0);
-        } else {
-            std::string response = "500 Syntax error, command unrecognized.\r\n";
-            send(clientSocket, response.c_str(), response.length(), 0);
-        }
-    }
     closesocket(clientSocket);
 }
 
@@ -297,7 +260,6 @@ void handleHttpConnection(SOCKET clientSocket, sockaddr_in clientAddr) {
     std::string clientIP = inet_ntoa(clientAddr.sin_addr);
     int clientPort = ntohs(clientAddr.sin_port);
     log("HTTP connection from " + clientIP + ":" + std::to_string(clientPort) + " on port " + std::to_string(HTTP_PORT));
-    
     std::string request_line = "";
     std::string full_request = "";
     while (true) {
@@ -310,7 +272,6 @@ void handleHttpConnection(SOCKET clientSocket, sockaddr_in clientAddr) {
             break;
         }
     }
-
     if (!full_request.empty()) {
         log("HTTP Request from " + clientIP + ":\n" + full_request);
         std::istringstream iss(full_request);
@@ -325,7 +286,6 @@ void handleHttpConnection(SOCKET clientSocket, sockaddr_in clientAddr) {
     } else {
         log("No HTTP request received from " + clientIP);
     }
-
     std::string response = 
         "HTTP/1.1 200 OK\r\n"
         "Content-Type: text/html\r\n"
@@ -337,6 +297,153 @@ void handleHttpConnection(SOCKET clientSocket, sockaddr_in clientAddr) {
 }
 
 
+// --- MODIFIED FTP Handler ---
+void handleFtpConnection(SOCKET clientSocket, sockaddr_in clientAddr) {
+    std::string clientIP = inet_ntoa(clientAddr.sin_addr);
+    int clientPort = ntohs(clientAddr.sin_port);
+    log("FTP connection from " + clientIP + ":" + std::to_string(clientPort) + " on port " + std::to_string(FTP_PORT));
+    std::string banner = "220 Fake FTP Server ready.\r\n";
+    send(clientSocket, banner.c_str(), banner.length(), 0);
+
+    std::string command_line;
+    std::string last_user = ""; 
+    bool passiveMode = false;
+    int passivePort = 0;
+
+    struct _stat info_uploads;
+    if (_stat("logs/uploads", &info_uploads) != 0) {
+        if (_mkdir("logs/uploads") != 0) {
+            log("Failed to create logs/uploads directory: " + std::string(strerror(errno)));
+        }
+    }
+
+    while (true) {
+        command_line = readLine(clientSocket);
+        if (command_line.empty()) {
+            log("FTP connection closed by " + clientIP);
+            break;
+        }
+
+        log("FTP command from " + clientIP + ": " + command_line);
+
+        std::string cmd_upper = command_line;
+        std::transform(cmd_upper.begin(), cmd_upper.end(), cmd_upper.begin(), ::toupper);
+        
+        if (cmd_upper.rfind("USER ", 0) == 0) {
+            last_user = command_line.substr(5);
+            log("FTP Username captured: " + last_user + " from " + clientIP);
+            std::string response = "331 Password required for " + last_user + ".\r\n";
+            send(clientSocket, response.c_str(), response.length(), 0);
+        } else if (cmd_upper.rfind("PASS ", 0) == 0) {
+            std::string password = command_line.substr(5);
+            log("FTP Password captured: " + password + " for user " + last_user + " from " + clientIP);
+            std::string response = "530 Login incorrect.\r\n";
+            send(clientSocket, response.c_str(), response.length(), 0);
+        } else if (cmd_upper.rfind("PASV", 0) == 0) {
+            passiveMode = true;
+            std::mt19937_64 eng{static_cast<long unsigned int>(std::chrono::high_resolution_clock::now().time_since_epoch().count())};
+            std::uniform_int_distribution<> dist{50000, 59999};
+            passivePort = dist(eng);
+            
+            // --- Reverted back to the more robust gethostname/gethostbyname method ---
+            char hostname[256];
+            gethostname(hostname, sizeof(hostname));
+            struct hostent *host_info = gethostbyname(hostname);
+            
+            if (host_info == NULL) {
+                 log("FTP PASV: Failed to get hostname. Responding with dummy IP.");
+                 std::string response = "227 Entering Passive Mode (127,0,0,1," + std::to_string(passivePort / 256) + "," + std::to_string(passivePort % 256) + ").\r\n";
+                 send(clientSocket, response.c_str(), response.length(), 0);
+                 continue;
+            }
+            
+            struct in_addr **addr_list = (struct in_addr **)host_info->h_addr_list;
+            std::string myIP = inet_ntoa(*addr_list[0]);
+            
+            size_t pos;
+            while ((pos = myIP.find('.')) != std::string::npos) {
+                myIP.replace(pos, 1, ",");
+            }
+            
+            std::string response = "227 Entering Passive Mode (" + myIP + "," + std::to_string(passivePort / 256) + "," + std::to_string(passivePort % 256) + ").\r\n";
+            send(clientSocket, response.c_str(), response.length(), 0);
+
+            log("FTP PASV: Told client to connect to " + myIP + ":" + std::to_string(passivePort));
+            
+        } else if (cmd_upper.rfind("STOR ", 0) == 0) {
+            if (!passiveMode) {
+                std::string response = "503 Bad sequence of commands (PASV command required first).\r\n";
+                send(clientSocket, response.c_str(), response.length(), 0);
+                continue;
+            }
+            
+            std::string fileName = command_line.substr(5);
+            log("FTP STOR: Client wants to upload file '" + fileName + "'");
+            
+            std::string response = "150 Opening BINARY mode data connection for " + fileName + ".\r\n";
+            send(clientSocket, response.c_str(), response.length(), 0);
+            
+            SOCKET data_listener = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+            if (data_listener == INVALID_SOCKET) {
+                log("FTP STOR: Failed to create data listener socket.");
+                closesocket(clientSocket);
+                break;
+            }
+            sockaddr_in data_address;
+            data_address.sin_family = AF_INET;
+            data_address.sin_addr.s_addr = INADDR_ANY;
+            data_address.sin_port = htons(passivePort);
+            
+            int iResult = bind(data_listener, (struct sockaddr *)&data_address, sizeof(data_address));
+            if (iResult == SOCKET_ERROR) {
+                log("FTP STOR: Failed to bind data listener socket.");
+                closesocket(clientSocket);
+                closesocket(data_listener);
+                break;
+            }
+            
+            listen(data_listener, 1);
+            
+            sockaddr_in data_client_addr;
+            int data_addrlen = sizeof(data_client_addr);
+            SOCKET data_socket = accept(data_listener, (struct sockaddr*)&data_client_addr, &data_addrlen);
+            
+            closesocket(data_listener);
+
+            if (data_socket == INVALID_SOCKET) {
+                log("FTP STOR: Failed to accept data connection.");
+                closesocket(clientSocket);
+                break;
+            }
+            
+            handleFtpDataConnection(data_socket, clientIP, fileName);
+            
+            response = "226 Transfer complete.\r\n";
+            send(clientSocket, response.c_str(), response.length(), 0);
+
+            passiveMode = false;
+            passivePort = 0;
+            
+        } else if (cmd_upper == "QUIT" || cmd_upper == "BYE") {
+            std::string response = "221 Goodbye.\r\n";
+            send(clientSocket, response.c_str(), response.length(), 0);
+            break;
+        } else if (cmd_upper == "SYST") {
+            std::string response = "215 UNIX Type: L8\r\n";
+            send(clientSocket, response.c_str(), response.length(), 0);
+        } else if (cmd_upper == "FEAT") {
+            std::string response = "211-Features:\r\n EPRT\r\n EPSV\r\n MDTM\r\n MFMT\r\n REST STREAM\r\n SIZE\r\n MLST type*;size*;sizd*;modify*;perm*;\r\n MLSD\r\n UTF8\r\n CLNT\r\n TVFS\r\n\r\n";
+            send(clientSocket, response.c_str(), response.length(), 0);
+        } else if (cmd_upper.rfind("HELP", 0) == 0) {
+            std::string response = "214 The following commands are recognized.\r\n CWD   CDUP   QUIT   PORT   PASV   TYPE   STRU   MODE   RETR   STOR   APPE   ALLOC   RNFR   RNTO   DELE   RMD   MKD   PWD   LIST   NLST   SITE   SYST   STAT   HELP   NOOP   FEAT\r\n214 Help OK.\r\n";
+            send(clientSocket, response.c_str(), response.length(), 0);
+        } else {
+            std::string response = "500 Syntax error, command unrecognized.\r\n";
+            send(clientSocket, response.c_str(), response.length(), 0);
+        }
+    }
+    closesocket(clientSocket);
+}
 // --- Main Function ---
 int main() {
     WSADATA wsaData;
