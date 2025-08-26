@@ -1,3 +1,4 @@
+// c++ standard library's
 #include <iostream>
 #include <fstream>
 #include <sstream>
@@ -37,7 +38,9 @@
 #define FTP_PORT 21
 #define HTTP_PORT 8080
 
+// Defining log file path
 #define LOGFILE "logs/honeypot.log"
+
 
 // --- Utility Functions ---
 std::string timestamp() {
@@ -51,6 +54,8 @@ std::string timestamp() {
     return std::string(buf);
 }
 
+// logging function : creates a structure called _stat info, checks if the logs directory exists
+// if not, uses _mkdir functionn to create the directory, once created uses logFile function to appened or add the timestamp, message to the file 
 void log(const std::string& message) {
     struct _stat info;
     if (_stat("logs", &info) != 0) {
@@ -67,11 +72,14 @@ void log(const std::string& message) {
     }
 }
 
+
+// Print winsock errors
 void printWinsockError(const char* funcName) {
     int wsError = WSAGetLastError();
     std::cerr << funcName << " failed with error: " << wsError << std::endl;
 }
 
+// function readLine : takes a socket as an argument and reads it line by line and returns it line by line..
 std::string readLine(SOCKET sock) {
     std::string line = "";
     char buffer;
@@ -100,7 +108,10 @@ std::string readLine(SOCKET sock) {
 }
 
 
-// --- New FTP Data Connection Handler ---
+// FTP data connection handler function takes care of receiving files from FTP clients, takes clientSocket as argv
+// It creates a directory called uploads for the files uploaded, if it doesn't exist 
+// If the file transfer is successfull, we log the event and then close the client socket
+// After that the received bytes are stored in a buffer and written to the file
 void handleFtpDataConnection(SOCKET clientSocket, const std::string& clientIP, const std::string& fileName) {
     struct _stat info;
     if (_stat("logs/uploads", &info) != 0) {
@@ -141,7 +152,7 @@ void handleFtpDataConnection(SOCKET clientSocket, const std::string& clientIP, c
 }
 
 
-// --- Shell Interaction ---
+// handles shell interaction with different protocols and different commands
 void handleShellInteraction(SOCKET clientSocket, const std::string& clientIP, int clientPort, const std::string& protocolName) {
     std::string prompt = "user@honeypot:~# ";
     std::string initialPrompt = prompt + "\n";
