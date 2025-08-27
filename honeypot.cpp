@@ -56,19 +56,16 @@ std::string timestamp() {
 
 // logging function : creates a structure called _stat info, checks if the logs directory exists
 // if not, uses _mkdir functionn to create the directory, once created uses logFile function to appened or add the timestamp, message to the file 
-void log(const std::string& message) {
-    struct _stat info;
-    if (_stat("logs", &info) != 0) {
-        if (_mkdir("logs") != 0) {
+void log(const std::string& message){
+    if(_stat("logs", &info) != 0){
+        if(_mkdir("logs") != 0){
             std::cerr << "Failed to create logs directory: " << strerror(errno) << std::endl;
         }
     }
 
     std::ofstream logFile(LOGFILE, std::ios::app);
-    if (logFile) {
-        logFile << "[" << timestamp() << "] " << message << std::endl;
-    } else {
-        std::cerr << "Error: Could not open log file " << LOGFILE << std::endl;
+    if(logFile){
+        logFile << "[" << timestamp() << "]" << message << std::endl;
     }
 }
 
